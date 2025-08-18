@@ -28,5 +28,7 @@ async def scrape_saucedemo(lookup_key: str | None) -> List[Dict]:
             if img_url and img_url.startswith("/"):
                 img_url = "https://www.saucedemo.com" + img_url
             data.append({"name": name, "price": price, "description": desc, "image_url": img_url})
+        
+        print(f"Total productos encontrados en SauceDemo: {len(data)}")
         await browser.close()
         return data
