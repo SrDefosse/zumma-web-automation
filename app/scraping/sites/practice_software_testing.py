@@ -1,8 +1,47 @@
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, BrowserContext
 from typing import List, Dict, Set
 from urllib.parse import urljoin
 
 BASE = "https://practicesoftwaretesting.com"
+
+async def scrape_product_detail(context: BrowserContext, url: str) -> Dict[str, str]:
+    price = "N/A"
+    desc = ""
+    detail_page = None
+    
+    try:
+        detail_page = await context.new_page()
+        await detail_page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        
+        # Intentar obtener el precio
+        try:
+            await detail_page.wait_for_selector("[data-test='unit-price']", timeout=5000)
+            price_el = await detail_page.query_selector("[data-test='unit-price']")
+            if price_el:
+                price = (await price_el.inner_text()).strip()
+        except Exception:
+            print(f"Precio no encontrado en {url}")
+        
+        # Intentar obtener la descripción
+        try:
+            await detail_page.wait_for_selector("[data-test='product-description']", timeout=5000)
+            desc_el = await detail_page.query_selector(
+                "p#description[data-test='product-description'], [data-test='product-description'], p#description, p.product-description"
+            )
+            if desc_el:
+                scraped_desc = (await desc_el.inner_text()).strip()
+                if scraped_desc:
+                    desc = scraped_desc
+        except Exception:
+            print(f"Descripción no encontrada en {url}")
+            
+    except Exception as e:
+        print(f"Fallo al obtener detalles de {url}: {e}")
+    finally:
+        if detail_page:
+            await detail_page.close()
+    
+    return {"price": price, "description": desc}
 
 async def scrape_practice(lookup_key: str | None) -> List[Dict]:
     async with async_playwright() as p:
@@ -81,31 +120,10 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
                             continue
                         seen_links.add(item["product_url"])
 
-                        price = "N/A"
-                        desc = ""
-                        try:
-                            detail_page = await ctx.new_page()
-                            await detail_page.goto(item["product_url"], wait_until="domcontentloaded", timeout=15000)
-                            
-                            # esperar a que los elementos dinámicos carguen
-                            await detail_page.wait_for_selector("[data-test='unit-price']", timeout=5000)
-                            await detail_page.wait_for_selector("[data-test='product-description']", timeout=5000)
-
-                            # se obtiene precio
-                            price_el = await detail_page.query_selector("[data-test='unit-price']")
-                            if price_el:
-                                price = (await price_el.inner_text()).strip()
-
-                            # se obtiene descripción
-                            desc_el = await detail_page.query_selector("p#description[data-test='product-description'], [data-test='product-description'], p#description, p.product-description")
-                            if desc_el:
-                                scraped_desc = (await desc_el.inner_text()).strip()
-                                if scraped_desc:
-                                    desc = scraped_desc
-                            
-                            await detail_page.close()
-                        except Exception as e:
-                            print(f"Detalle falló para {item['product_url']}: {e}")
+                        # usar función auxiliar para obtener detalles
+                        details = await scrape_product_detail(ctx, item["product_url"])
+                        price = details["price"]
+                        desc = details["description"]
 
                         data.append({
                             "name": item["name"],
@@ -199,27 +217,9 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
                                 continue
                             seen_links.add(item["product_url"])
 
-                            desc = ""
-                            try:
-                                detail = await ctx.new_page()
-                                await detail.goto(item["product_url"], wait_until="domcontentloaded", timeout=15000)
-                                try:
-                                    await detail.wait_for_selector("p#description[data-test='product-description']", timeout=5000)
-                                    desc_el = await detail.query_selector("p#description[data-test='product-description']")
-                                    if desc_el:
-                                        scraped_desc = (await desc_el.inner_text()).strip()
-                                        if scraped_desc:
-                                            desc = scraped_desc
-                                except Exception:
-                                    # fallback por si cambia el DOM
-                                    alt = await detail.query_selector("[data-test='product-description'], p#description, p.product-description")
-                                    if alt:
-                                        scraped_desc = (await alt.inner_text()).strip()
-                                        if scraped_desc:
-                                            desc = scraped_desc
-                                await detail.close()
-                            except Exception as e:
-                                print(f"Detalle falló {item['product_url']}: {e}")
+                            # usar función auxiliar para obtener detalles (solo necesitamos descripción)
+                            details = await scrape_product_detail(ctx, item["product_url"])
+                            desc = details["description"]
 
                             data.append({
                                 "name": item["name"],
