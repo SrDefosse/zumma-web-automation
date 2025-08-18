@@ -1,8 +1,67 @@
-from playwright.async_api import async_playwright, BrowserContext
-from typing import List, Dict, Set
+from playwright.async_api import async_playwright, BrowserContext, Locator
+from typing import List, Dict, Set, Optional
 from urllib.parse import urljoin
 
 BASE = "https://practicesoftwaretesting.com"
+
+async def get_product_name(element: Locator) -> str:
+    # Intenta obtener el nombre del producto usando múltiples selectores con Locator.
+    name_selectors = [
+        "[data-test='product-name']", 
+        ".product-name", 
+        ".card-title"
+    ]
+    
+    for selector in name_selectors:
+        try:
+            name_locator = element.locator(selector)
+            if await name_locator.count() > 0:
+                name = (await name_locator.inner_text()).strip()
+                if name:
+                    return name
+        except Exception:
+            continue
+    
+    return ""
+
+async def get_product_price(element: Locator) -> str:
+    # intenta obtener el precio del producto usando varios selectores con Locator.
+    price_selectors = [
+        "[data-test='product-price']", 
+        ".product-price"
+    ]
+    
+    for selector in price_selectors:
+        try:
+            price_locator = element.locator(selector)
+            if await price_locator.count() > 0:
+                price = (await price_locator.inner_text()).strip()
+                if price:
+                    return price
+        except Exception:
+            continue
+    
+    return ""
+
+async def get_product_image_url(element: Locator) -> str:
+    # obtiene la url de la imagen del producto usando Locator.
+    try:
+        img_locator = element.locator("img")
+        if await img_locator.count() > 0:
+            raw_img = await img_locator.get_attribute("src")
+            if raw_img:
+                if raw_img.startswith("//"):
+                    return "https:" + raw_img
+                elif raw_img.startswith("/"):
+                    return BASE + raw_img
+                elif raw_img.startswith("http"):
+                    return raw_img
+                else:
+                    return f"{BASE}/{raw_img}"
+    except Exception:
+        pass
+    
+    return "https://via.placeholder.com/150x150.png?text=No+Image"
 
 async def scrape_product_detail(context: BrowserContext, url: str) -> Dict[str, str]:
     price = "N/A"
@@ -142,60 +201,42 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
                     while True:
                         print(f"Scraping pagina {current_page} de {category_url}")
                         
-                        # encontrar cards de productos en la página actual
-                        product_cards = []
+                        # encontrar cards de productos en la página actual usando Locators
+                        product_cards_locator = None
                         for sel in [".product-card", ".card"]:
-                            product_cards = await page.query_selector_all(sel)
-                            if product_cards:
+                            cards_locator = page.locator(sel)
+                            if await cards_locator.count() > 0:
+                                product_cards_locator = cards_locator
                                 break
 
-                        if not product_cards:
+                        if not product_cards_locator or await product_cards_locator.count() == 0:
                             print(f"No cards en {page.url}")
                             break
 
-                        print(f"Encontradas {len(product_cards)} cards en pagina {current_page}")
+                        cards_count = await product_cards_locator.count()
+                        print(f"Encontradas {cards_count} cards en pagina {current_page}")
 
                         # snapshot de productos de esta página
                         page_products = []
-                        for c in product_cards:
-                            # nombre
-                            name = ""
-                            for name_sel in ["[data-test='product-name']", ".product-name", ".card-title"]:
-                                el = await c.query_selector(name_sel)
-                                if el:
-                                    name = (await el.inner_text()).strip()
-                                    break
+                        for i in range(cards_count):
+                            card_locator = product_cards_locator.nth(i)
+                            
+                            # usar función auxiliar para obtener nombre
+                            name = await get_product_name(card_locator)
                             if not name:
                                 continue
                             if lookup_key and lookup_key.lower() not in name.lower():
                                 continue
 
-                            # precio
-                            price = ""
-                            for price_sel in ["[data-test='product-price']", ".product-price"]:
-                                el = await c.query_selector(price_sel)
-                                if el:
-                                    price = (await el.inner_text()).strip()
-                                    break
+                            # usar función auxiliar para obtener precio
+                            price = await get_product_price(card_locator)
 
-                            # imagen desde la card
-                            img_url = ""
-                            img_el = await c.query_selector("img")
-                            if img_el:
-                                raw_img = await img_el.get_attribute("src")
-                                if raw_img:
-                                    if raw_img.startswith("//"):
-                                        img_url = "https:" + raw_img
-                                    elif raw_img.startswith("/"):
-                                        img_url = BASE + raw_img
-                                    elif raw_img.startswith("http"):
-                                        img_url = raw_img
-                                    else:
-                                        img_url = f"{BASE}/{raw_img}"
+                            # usar función auxiliar para obtener imagen
+                            img_url = await get_product_image_url(card_locator)
 
                             # se obtiene url del producto
                             product_url = ""
-                            href = await c.get_attribute("href")
+                            href = await card_locator.get_attribute("href")
                             if href:
                                 product_url = href if href.startswith("http") else urljoin(BASE, href)
 
@@ -205,7 +246,7 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
                             page_products.append({
                                 "name": name,
                                 "price": price or "N/A",
-                                "image_url": img_url or "https://via.placeholder.com/150x150.png?text=No+Image",
+                                "image_url": img_url,
                                 "product_url": product_url,
                             })
 
@@ -239,30 +280,31 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
                         try:
                             print(f"Buscando navegación desde pagina {current_page}")
                             
-                            # se captura contenido actual para detectar cambios
-                            current_products = await page.query_selector_all(".card")
-                            current_product_count = len(current_products)
+                            # se captura contenido actual para detectar cambios usando Locators
+                            current_cards_locator = page.locator(".card")
+                            current_product_count = await current_cards_locator.count()
                             
                             # se obtiene nombres de los primeros productos para comparar
                             current_names = []
-                            for card in current_products[:3]:
+                            for i in range(min(3, current_product_count)):
                                 try:
-                                    name_el = await card.query_selector("[data-test='product-name']")
-                                    if name_el:
-                                        name = await name_el.inner_text()
+                                    card_locator = current_cards_locator.nth(i)
+                                    name_locator = card_locator.locator("[data-test='product-name']")
+                                    if await name_locator.count() > 0:
+                                        name = await name_locator.inner_text()
                                         current_names.append(name.strip())
                                 except:
                                     pass
                             
                             print(f"Pagina actual: {current_product_count} productos - {current_names[:2]}")
                             
-                            # verificar si existe el botón Next
+                            # verificar si existe el botón Next usando Locator
                             next_selector = 'a[aria-label="Next"][role="button"].page-link'
-                            next_exists = await page.query_selector(next_selector)
+                            next_locator = page.locator(next_selector)
                             
-                            if next_exists:
+                            if await next_locator.count() > 0:
                                 # verificar si está visible y habilitado
-                                is_visible = await next_exists.is_visible()
+                                is_visible = await next_locator.is_visible()
                                 if is_visible:
                                     print(f"Botón Next encontrado y visible, haciendo click...")
                                     
@@ -272,23 +314,25 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
                                     # esperar a que el contenido se actualice
                                     await page.wait_for_timeout(2000) 
                                     
-                                    # verificar si el contenido cambió
-                                    new_products = await page.query_selector_all(".card")
+                                    # verificar si el contenido cambió usando Locators
+                                    new_cards_locator = page.locator(".card")
+                                    new_product_count = await new_cards_locator.count()
                                     new_names = []
                                     
-                                    for card in new_products[:3]:
+                                    for i in range(min(3, new_product_count)):
                                         try:
-                                            name_el = await card.query_selector("[data-test='product-name']")
-                                            if name_el:
-                                                name = await name_el.inner_text()
+                                            card_locator = new_cards_locator.nth(i)
+                                            name_locator = card_locator.locator("[data-test='product-name']")
+                                            if await name_locator.count() > 0:
+                                                name = await name_locator.inner_text()
                                                 new_names.append(name.strip())
                                         except:
                                             pass
                                     
-                                    print(f"Nueva página: {len(new_products)} productos - {new_names[:2]}")
+                                    print(f"Nueva página: {new_product_count} productos - {new_names[:2]}")
                                     
                                     # verificar si realmente cambió el contenido
-                                    if new_names != current_names and len(new_products) > 0:
+                                    if new_names != current_names and new_product_count > 0:
                                         current_page += 1
                                         navigated = True
                                         print(f"Navegación exitosa a página {current_page}")
@@ -303,30 +347,32 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
                             if not navigated:
                                 next_page_num = current_page + 1
                                 page_num_selector = f'a[aria-label="Page-{next_page_num}"][role="button"].page-link'
-                                page_num_exists = await page.query_selector(page_num_selector)
+                                page_num_locator = page.locator(page_num_selector)
                                 
-                                if page_num_exists:
-                                    is_visible = await page_num_exists.is_visible()
+                                if await page_num_locator.count() > 0:
+                                    is_visible = await page_num_locator.is_visible()
                                     if is_visible:
                                         print(f"Intentando con botón página {next_page_num}")
                                         
                                         await page.click(page_num_selector)
                                         await page.wait_for_timeout(2000)
                                         
-                                        # verificar cambio de contenido
-                                        new_products = await page.query_selector_all(".card")
+                                        # verificar cambio de contenido usando Locators
+                                        new_cards_locator = page.locator(".card")
+                                        new_product_count = await new_cards_locator.count()
                                         new_names = []
                                         
-                                        for card in new_products[:3]:
+                                        for i in range(min(3, new_product_count)):
                                             try:
-                                                name_el = await card.query_selector("[data-test='product-name']")
-                                                if name_el:
-                                                    name = await name_el.inner_text()
+                                                card_locator = new_cards_locator.nth(i)
+                                                name_locator = card_locator.locator("[data-test='product-name']")
+                                                if await name_locator.count() > 0:
+                                                    name = await name_locator.inner_text()
                                                     new_names.append(name.strip())
                                             except:
                                                 pass
                                         
-                                        if new_names != current_names and len(new_products) > 0:
+                                        if new_names != current_names and new_product_count > 0:
                                             current_page = next_page_num
                                             navigated = True
                                             print(f"Navegación exitosa a página {current_page}")
@@ -355,8 +401,6 @@ async def scrape_practice(lookup_key: str | None) -> List[Dict]:
         
         # resumen final
         print(f"\nRESUMEN FINAL:")
-        for url, count in products_per_category.items():
-            print(f"  {url}: {count} productos")
         print(f"Total productos únicos de Practice: {len(data)}")
         
         return data
