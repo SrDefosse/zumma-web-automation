@@ -133,7 +133,7 @@ GET /images/Sauce-Labs-Backpack-75a11aed8b615baa.jpg
 
 1. **Clonar el repositorio:**
 ```bash
-git clone <repository-url>
+git clone https://github.com/SrDefosse/zumma-web-automation
 cd zumma-web-automation
 ```
 
