@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    container_name: webauto_api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    volumes:
+      - ./storage/images:/app/storage/images
+      - ./:/app
+  db:
+    image: postgres:16
+    container_name: webauto_db
+    environment:
+      POSTGRES_DB: webauto
+      POSTGRES_USER: webauto
+      POSTGRES_PASSWORD: webauto
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
