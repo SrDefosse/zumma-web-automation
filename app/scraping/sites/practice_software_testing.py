@@ -1,406 +1,237 @@
-from playwright.async_api import async_playwright, BrowserContext, Locator
-from typing import List, Dict, Set, Optional
-from urllib.parse import urljoin
+"""Scraper de https://practicesoftwaretesting.com/ (catalogo publico, sin login).
 
-BASE = "https://practicesoftwaretesting.com"
+El listado no trae la descripcion, asi que hace dos pasadas: primero recorre los
+listados paginados, despues visita el detalle de cada producto unico.
+"""
 
-async def get_product_name(element: Locator) -> str:
-    # Intenta obtener el nombre del producto usando múltiples selectores con Locator.
-    name_selectors = [
-        "[data-test='product-name']", 
-        ".product-name", 
-        ".card-title"
+import asyncio
+from typing import Any
+
+from playwright.async_api import BrowserContext
+
+from app.config import settings
+from app.logging_config import get_logger
+from app.scraping.types import ScrapedProduct
+from app.scraping.urls import absolutize
+
+log = get_logger(__name__)
+
+BASE_URL = "https://practicesoftwaretesting.com"
+
+LISTING_PATHS = (
+    "/",
+    "/category/hand-tools",
+    "/category/power-tools",
+    "/category/other",
+    "/rentals",
+)
+
+MAX_PAGES_PER_LISTING = 25
+DETAIL_CONCURRENCY = 4
+
+_EXTRACT_CARDS_JS = """
+() => {
+  const marked = Array.from(document.querySelectorAll('[data-test^="product-"]'));
+  const cards = marked.length
+    ? marked
+    : Array.from(document.querySelectorAll('a.card, .product-card'));
+  return cards.map((card) => {
+    const pick = (selectors) => {
+      for (const selector of selectors) {
+        const node = card.querySelector(selector);
+        const text = node && node.innerText ? node.innerText.trim() : '';
+        if (text) return text;
+      }
+      return '';
+    };
+    const anchor = card.matches('a[href]') ? card : card.querySelector('a[href]');
+    const marker = card.getAttribute('data-test') || '';
+    const img = card.querySelector('img');
+    return {
+      product_id: marker.indexOf('product-') === 0 ? marker.substring(8) : '',
+      name: pick(['[data-test="product-name"]', '.product-name', '.card-title']),
+      price: pick(['[data-test="product-price"]', '.product-price']),
+      image_url: img ? img.getAttribute('src') || '' : '',
+      href: anchor ? anchor.getAttribute('href') || '' : '',
+    };
+  });
+}
+"""
+
+_EXTRACT_DETAIL_JS = """
+() => {
+  const pick = (selectors) => {
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      const text = node && node.innerText ? node.innerText.trim() : '';
+      if (text) return text;
+    }
+    return '';
+  };
+  return {
+    price: pick(['[data-test="unit-price"]', '[data-test="product-price"]']),
+    description: pick([
+      'p#description[data-test="product-description"]',
+      '[data-test="product-description"]',
+      'p#description',
+      'p.product-description',
+    ]),
+  };
+}
+"""
+
+
+def listing_url(path: str, page_number: int) -> str:
+    """URL de un listado para una pagina dada.
+
+    El sitio pagina por query param, asi que la navegacion es determinista y no hace
+    falta clickear "Next" ni detectar el cambio de pagina por el contenido.
+    """
+    base = f"{BASE_URL}{path}" if path.startswith("/") else f"{BASE_URL}/{path}"
+    if page_number <= 1:
+        return base
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}page={page_number}"
+
+
+def card_key(card: dict[str, Any]) -> str:
+    """Identidad estable de una card, para deduplicar entre categorias y paginas."""
+    product_id = (card.get("product_id") or "").strip()
+    if product_id:
+        return f"id:{product_id}"
+    href = (card.get("href") or "").strip()
+    if href:
+        return f"url:{absolutize(BASE_URL, href)}"
+    return f"name:{(card.get('name') or '').strip().lower()}"
+
+
+def detail_url(card: dict[str, Any]) -> str | None:
+    """URL de la pagina de detalle de una card, o None si no se puede determinar."""
+    href = (card.get("href") or "").strip()
+    if href:
+        return absolutize(BASE_URL, href)
+    product_id = (card.get("product_id") or "").strip()
+    return f"{BASE_URL}/product/{product_id}" if product_id else None
+
+
+def matches_lookup(name: str, lookup_key: str | None) -> bool:
+    if not lookup_key:
+        return True
+    return lookup_key.lower().strip() in name.lower()
+
+
+def select_new_cards(
+    raw_cards: list[dict[str, Any]], lookup_key: str | None, seen: set[str]
+) -> tuple[list[dict[str, Any]], int]:
+    """Filtra las cards ya vistas y las que no matchean el lookup_key.
+
+    Devuelve (cards a scrapear, cantidad de cards nuevas). La segunda cuenta incluye las
+    descartadas por lookup_key: es la senial de "esta pagina aporto algo" que corta la
+    paginacion, y debe ser independiente del filtro.
+    """
+    new_cards = [card for card in raw_cards if card_key(card) not in seen]
+    for card in new_cards:
+        seen.add(card_key(card))
+
+    selected = [
+        card
+        for card in new_cards
+        if (card.get("name") or "").strip() and matches_lookup(card["name"], lookup_key)
     ]
-    
-    for selector in name_selectors:
-        try:
-            name_locator = element.locator(selector)
-            if await name_locator.count() > 0:
-                name = (await name_locator.inner_text()).strip()
-                if name:
-                    return name
-        except Exception:
-            continue
-    
-    return ""
+    return selected, len(new_cards)
 
-async def get_product_price(element: Locator) -> str:
-    # intenta obtener el precio del producto usando varios selectores con Locator.
-    price_selectors = [
-        "[data-test='product-price']", 
-        ".product-price"
-    ]
-    
-    for selector in price_selectors:
-        try:
-            price_locator = element.locator(selector)
-            if await price_locator.count() > 0:
-                price = (await price_locator.inner_text()).strip()
-                if price:
-                    return price
-        except Exception:
-            continue
-    
-    return ""
 
-async def get_product_image_url(element: Locator) -> str:
-    # obtiene la url de la imagen del producto usando Locator.
+async def _collect_listing_cards(
+    context: BrowserContext, path: str, lookup_key: str | None, seen: set[str]
+) -> list[dict[str, Any]]:
+    """Recorre un listado pagina por pagina y devuelve sus cards nuevas."""
+    page = await context.new_page()
+    collected: list[dict[str, Any]] = []
     try:
-        img_locator = element.locator("img")
-        if await img_locator.count() > 0:
-            raw_img = await img_locator.get_attribute("src")
-            if raw_img:
-                if raw_img.startswith("//"):
-                    return "https:" + raw_img
-                elif raw_img.startswith("/"):
-                    return BASE + raw_img
-                elif raw_img.startswith("http"):
-                    return raw_img
-                else:
-                    return f"{BASE}/{raw_img}"
-    except Exception:
-        pass
-    
-    return "https://via.placeholder.com/150x150.png?text=No+Image"
-
-async def scrape_product_detail(context: BrowserContext, url: str) -> Dict[str, str]:
-    price = "N/A"
-    desc = ""
-    detail_page = None
-    
-    try:
-        detail_page = await context.new_page()
-        await detail_page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        
-        # Intentar obtener el precio
-        try:
-            await detail_page.wait_for_selector("[data-test='unit-price']", timeout=5000)
-            price_el = await detail_page.query_selector("[data-test='unit-price']")
-            if price_el:
-                price = (await price_el.inner_text()).strip()
-        except Exception:
-            print(f"Precio no encontrado en {url}")
-        
-        # Intentar obtener la descripción
-        try:
-            await detail_page.wait_for_selector("[data-test='product-description']", timeout=5000)
-            desc_el = await detail_page.query_selector(
-                "p#description[data-test='product-description'], [data-test='product-description'], p#description, p.product-description"
-            )
-            if desc_el:
-                scraped_desc = (await desc_el.inner_text()).strip()
-                if scraped_desc:
-                    desc = scraped_desc
-        except Exception:
-            print(f"Descripción no encontrada en {url}")
-            
-    except Exception as e:
-        print(f"Fallo al obtener detalles de {url}: {e}")
-    finally:
-        if detail_page:
-            await detail_page.close()
-    
-    return {"price": price, "description": desc}
-
-async def scrape_practice(lookup_key: str | None) -> List[Dict]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context()
-        page = await ctx.new_page()
-
-        data: List[Dict] = []
-        seen_links: Set[str] = set()
-        
-
-        total_products_found = 0
-        products_per_category = {}
-
-        category_urls = [
-            f"{BASE}",
-            f"{BASE}/category/hand-tools",
-            f"{BASE}/category/power-tools", 
-            f"{BASE}/category/other",
-            f"{BASE}/rentals",
-        ]
-
-        for category_url in category_urls:
+        for page_number in range(1, MAX_PAGES_PER_LISTING + 1):
+            url = listing_url(path, page_number)
             try:
-                print(f"Iniciando scraping de categoria: {category_url}")
-                products_per_category[category_url] = 0
-                
-                await page.goto(category_url, wait_until="networkidle", timeout=15000)
-                await page.wait_for_timeout(1000)
+                await page.goto(url, wait_until="networkidle")
+            except Exception as exc:  # noqa: BLE001 - un listado caido no debe matar el job
+                log.warning("no se pudo abrir el listado", url=url, error=str(exc))
+                break
 
-                # para rentals 
-                if "rentals" in category_url:
-                    
-                    # se seleccionan todos los contenedores de productos de alquiler
-                    rental_product_containers = await page.query_selector_all("[data-test^='product-']")
-                    print(f"Encontrados {len(rental_product_containers)} productos de alquiler en la página.")
+            raw_cards = await page.evaluate(_EXTRACT_CARDS_JS)
+            if not raw_cards:
+                break
 
-                    rental_products = []
-                    for container in rental_product_containers:
-                        # se obtiene el id del producto desde data-test
-                        data_test = await container.get_attribute("data-test")
-                        product_id = data_test.split("product-")[-1]
-                        product_url = f"{BASE}/product/{product_id}"
+            selected, new_count = select_new_cards(raw_cards, lookup_key, seen)
+            collected.extend(selected)
 
-                        if product_url in seen_links:
-                            continue
-                        
-                        # se obtiene nombre del producto
-                        name = ""
-                        name_el = await container.query_selector(".card-title")
-                        if name_el:
-                            name = (await name_el.inner_text()).strip()
+            log.debug(
+                "pagina de listado procesada",
+                url=url,
+                cards=len(raw_cards),
+                nuevas=new_count,
+                seleccionadas=len(selected),
+            )
 
-                        if not name:
-                            continue
-                        
-                        # se obtiene url de la imagen
-                        img_url = ""
-                        img_el = await container.query_selector("img")
-                        if img_el:
-                            raw_img = await img_el.get_attribute("src")
-                            if raw_img:
-                                img_url = urljoin(BASE, raw_img)
+            if new_count == 0:
+                break
+    finally:
+        await page.close()
 
-                        rental_products.append({
-                            "name": name,
-                            "product_url": product_url,
-                            "image_url": img_url or "https://via.placeholder.com/150x150.png?text=No+Image",
-                        })
+    return collected
 
-                    print(f"{len(rental_products)} productos de alquiler encontrados.")
 
-                    # visitar cada rental para obtener precio y descripción
-                    for item in rental_products:
-                        if item["product_url"] in seen_links:
-                            continue
-                        seen_links.add(item["product_url"])
+async def _fetch_detail(
+    context: BrowserContext, url: str | None, semaphore: asyncio.Semaphore
+) -> dict[str, str]:
+    """Lee precio y descripcion de la pagina de detalle. Nunca lanza."""
+    empty = {"price": "", "description": ""}
+    if not url:
+        return empty
 
-                        # usar función auxiliar para obtener detalles
-                        details = await scrape_product_detail(ctx, item["product_url"])
-                        price = details["price"]
-                        desc = details["description"]
+    async with semaphore:
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_selector(
+                    '[data-test="product-description"], p#description',
+                    timeout=settings.playwright_timeout_ms // 3,
+                )
+            except Exception:  # noqa: BLE001 - la descripcion es opcional
+                log.debug("descripcion no encontrada", url=url)
+            return await page.evaluate(_EXTRACT_DETAIL_JS)
+        except Exception as exc:  # noqa: BLE001 - un detalle caido no debe matar el job
+            log.warning("no se pudo leer el detalle del producto", url=url, error=str(exc))
+            return empty
+        finally:
+            await page.close()
 
-                        data.append({
-                            "name": item["name"],
-                            "price": f"${price}" if price != "N/A" else "N/A",
-                            "description": desc,
-                            "image_url": item["image_url"],
-                        })
-                        
-                        total_products_found += 1
-                        products_per_category[category_url] += 1
-                        
-                        print(f"Producto RENTAL #{total_products_found} agregado: {item['name']} - Precio: {price} - Desc: {'SÍ' if desc else 'NO'}")
-                else:
-                    current_page = 1 
 
-                    while True:
-                        print(f"Scraping pagina {current_page} de {category_url}")
-                        
-                        # encontrar cards de productos en la página actual usando Locators
-                        product_cards_locator = None
-                        for sel in [".product-card", ".card"]:
-                            cards_locator = page.locator(sel)
-                            if await cards_locator.count() > 0:
-                                product_cards_locator = cards_locator
-                                break
+async def scrape(context: BrowserContext, lookup_key: str | None = None) -> list[ScrapedProduct]:
+    seen: set[str] = set()
+    cards: list[dict[str, Any]] = []
 
-                        if not product_cards_locator or await product_cards_locator.count() == 0:
-                            print(f"No cards en {page.url}")
-                            break
+    for path in LISTING_PATHS:
+        cards.extend(await _collect_listing_cards(context, path, lookup_key, seen))
 
-                        cards_count = await product_cards_locator.count()
-                        print(f"Encontradas {cards_count} cards en pagina {current_page}")
+    semaphore = asyncio.Semaphore(DETAIL_CONCURRENCY)
+    detail_urls = [detail_url(card) for card in cards]
+    details = await asyncio.gather(*(_fetch_detail(context, url, semaphore) for url in detail_urls))
 
-                        # snapshot de productos de esta página
-                        page_products = []
-                        for i in range(cards_count):
-                            card_locator = product_cards_locator.nth(i)
-                            
-                            # usar función auxiliar para obtener nombre
-                            name = await get_product_name(card_locator)
-                            if not name:
-                                continue
-                            if lookup_key and lookup_key.lower() not in name.lower():
-                                continue
+    products = [
+        ScrapedProduct.build(
+            name=card["name"],
+            price=card.get("price") or detail.get("price"),
+            description=detail.get("description"),
+            image_url=absolutize(BASE_URL, card.get("image_url")),
+            source_url=url,
+        )
+        for card, detail, url in zip(cards, details, detail_urls, strict=True)
+    ]
 
-                            # usar función auxiliar para obtener precio
-                            price = await get_product_price(card_locator)
-
-                            # usar función auxiliar para obtener imagen
-                            img_url = await get_product_image_url(card_locator)
-
-                            # se obtiene url del producto
-                            product_url = ""
-                            href = await card_locator.get_attribute("href")
-                            if href:
-                                product_url = href if href.startswith("http") else urljoin(BASE, href)
-
-                            if not product_url or product_url in seen_links:
-                                continue
-
-                            page_products.append({
-                                "name": name,
-                                "price": price or "N/A",
-                                "image_url": img_url,
-                                "product_url": product_url,
-                            })
-
-                        print(f"{len(page_products)} productos encontrados en pagina {current_page}")
-
-                        # para cada producto se obtiene descripción
-                        for item in page_products:
-                            if item["product_url"] in seen_links:
-                                continue
-                            seen_links.add(item["product_url"])
-
-                            # usar función auxiliar para obtener detalles (solo necesitamos descripción)
-                            details = await scrape_product_detail(ctx, item["product_url"])
-                            desc = details["description"]
-
-                            data.append({
-                                "name": item["name"],
-                                "price": item["price"],
-                                "description": desc,
-                                "image_url": item["image_url"],
-                            })
-                            
-                            total_products_found += 1
-                            products_per_category[category_url] += 1
-                            
-                            print(f"Producto #{total_products_found} agregado: {item['name']} - Descripción: {'SÍ' if desc else 'NO'}")
-
-                        # lógica de paginación
-                        navigated = False
-                        
-                        try:
-                            print(f"Buscando navegación desde pagina {current_page}")
-                            
-                            # se captura contenido actual para detectar cambios usando Locators
-                            current_cards_locator = page.locator(".card")
-                            current_product_count = await current_cards_locator.count()
-                            
-                            # se obtiene nombres de los primeros productos para comparar
-                            current_names = []
-                            for i in range(min(3, current_product_count)):
-                                try:
-                                    card_locator = current_cards_locator.nth(i)
-                                    name_locator = card_locator.locator("[data-test='product-name']")
-                                    if await name_locator.count() > 0:
-                                        name = await name_locator.inner_text()
-                                        current_names.append(name.strip())
-                                except:
-                                    pass
-                            
-                            print(f"Pagina actual: {current_product_count} productos - {current_names[:2]}")
-                            
-                            # verificar si existe el botón Next usando Locator
-                            next_selector = 'a[aria-label="Next"][role="button"].page-link'
-                            next_locator = page.locator(next_selector)
-                            
-                            if await next_locator.count() > 0:
-                                # verificar si está visible y habilitado
-                                is_visible = await next_locator.is_visible()
-                                if is_visible:
-                                    print(f"Botón Next encontrado y visible, haciendo click...")
-                                    
-                                    # hacer click directo
-                                    await page.click(next_selector)
-                                    
-                                    # esperar a que el contenido se actualice
-                                    await page.wait_for_timeout(2000) 
-                                    
-                                    # verificar si el contenido cambió usando Locators
-                                    new_cards_locator = page.locator(".card")
-                                    new_product_count = await new_cards_locator.count()
-                                    new_names = []
-                                    
-                                    for i in range(min(3, new_product_count)):
-                                        try:
-                                            card_locator = new_cards_locator.nth(i)
-                                            name_locator = card_locator.locator("[data-test='product-name']")
-                                            if await name_locator.count() > 0:
-                                                name = await name_locator.inner_text()
-                                                new_names.append(name.strip())
-                                        except:
-                                            pass
-                                    
-                                    print(f"Nueva página: {new_product_count} productos - {new_names[:2]}")
-                                    
-                                    # verificar si realmente cambió el contenido
-                                    if new_names != current_names and new_product_count > 0:
-                                        current_page += 1
-                                        navigated = True
-                                        print(f"Navegación exitosa a página {current_page}")
-                                    else:
-                                        print(f"Contenido no cambió, posiblemente última página")
-                                else:
-                                    print(f"Botón Next existe pero no está visible")
-                            else:
-                                print(f"Botón Next no encontrado")
-                            
-                            # si no funcionó con Next, intentar con número de página específico
-                            if not navigated:
-                                next_page_num = current_page + 1
-                                page_num_selector = f'a[aria-label="Page-{next_page_num}"][role="button"].page-link'
-                                page_num_locator = page.locator(page_num_selector)
-                                
-                                if await page_num_locator.count() > 0:
-                                    is_visible = await page_num_locator.is_visible()
-                                    if is_visible:
-                                        print(f"Intentando con botón página {next_page_num}")
-                                        
-                                        await page.click(page_num_selector)
-                                        await page.wait_for_timeout(2000)
-                                        
-                                        # verificar cambio de contenido usando Locators
-                                        new_cards_locator = page.locator(".card")
-                                        new_product_count = await new_cards_locator.count()
-                                        new_names = []
-                                        
-                                        for i in range(min(3, new_product_count)):
-                                            try:
-                                                card_locator = new_cards_locator.nth(i)
-                                                name_locator = card_locator.locator("[data-test='product-name']")
-                                                if await name_locator.count() > 0:
-                                                    name = await name_locator.inner_text()
-                                                    new_names.append(name.strip())
-                                            except:
-                                                pass
-                                        
-                                        if new_names != current_names and new_product_count > 0:
-                                            current_page = next_page_num
-                                            navigated = True
-                                            print(f"Navegación exitosa a página {current_page}")
-                                        else:
-                                            print(f"No hay cambio de contenido en página {next_page_num}")
-                                    else:
-                                        print(f"Botón página {next_page_num} existe pero no está visible")
-                                else:
-                                    print(f"No existe botón para página {next_page_num}")
-                            
-                            if not navigated:
-                                print(f"No hay más páginas disponibles en {category_url}")
-                                break
-                                
-                        except Exception as e:
-                            print(f"Error en paginación: {e}")
-                            break
-
-                print(f"Categoría {category_url} completada: {products_per_category[category_url]} productos")
-
-            except Exception as e:
-                print(f"Error en categoría {category_url}: {e}")
-                continue
-
-        await browser.close()
-        
-        # resumen final
-        print(f"\nRESUMEN FINAL:")
-        print(f"Total productos únicos de Practice: {len(data)}")
-        
-        return data
+    log.info(
+        "scraping de practicesoftwaretesting finalizado",
+        cards=len(cards),
+        productos=len(products),
+        lookup_key=lookup_key,
+    )
+    return products
