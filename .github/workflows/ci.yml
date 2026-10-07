@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  # El job end-to-end levanta el stack completo y scrapea sitios reales, asi que se
+  # dispara a mano: no conviene que una caida de un sitio externo ponga el CI en rojo.
+  workflow_dispatch:
+
+jobs:
+  quality:
+    name: Lint y tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.5.9"
+          enable-cache: true
+
+      - name: Instalar dependencias
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check app tests migrations
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: Verificar que las migraciones aplican y son reversibles
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///ci.db
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+
+  e2e:
+    name: End-to-end con Postman
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar configuracion
+        run: cp .env.example .env
+
+      - name: Levantar el stack
+        run: docker compose up -d --build --wait
+
+      - name: Correr la coleccion de Postman
+        run: |
+          npx -y newman run postman/zumma-web-automation.postman_collection.json \
+            -e postman/local.postman_environment.json \
+            --delay-request 3000 \
+            --reporters cli,json \
+            --reporter-json-export newman-report.json
+
+      - name: Logs si algo fallo
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: newman-report
+          path: newman-report.json
+
+      - name: Bajar el stack
+        if: always()
+        run: docker compose down -v
