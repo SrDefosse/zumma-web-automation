@@ -1,0 +1,41 @@
+[project]
+name = "zumma-web-automation"
+version = "1.0.0"
+description = "REST API que automatiza la extraccion de datos de productos con Playwright"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.0",
+    "sqlalchemy[asyncio]==2.0.36",
+    "asyncpg==0.30.0",
+    "alembic==1.14.0",
+    "arq==0.26.3",
+    "httpx==0.28.1",
+    "playwright==1.49.1",
+    "structlog==24.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.0",
+    "pytest-cov==6.0.0",
+    "aiosqlite==0.20.0",
+    "ruff==0.8.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# Depends() en los defaults es el patron documentado de FastAPI, no un bug.
+ignore = ["B008"]
