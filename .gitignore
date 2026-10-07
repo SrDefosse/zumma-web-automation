@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Entorno
+.env
+.env.*
+!.env.example
+
+# Artefactos de scraping
+storage/images/*
+!storage/images/.gitkeep
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

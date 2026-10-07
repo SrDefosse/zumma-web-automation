@@ -1,0 +1,16 @@
+# Normaliza finales de linea en el repositorio.
+* text=auto eol=lf
+
+# Los scripts y archivos que consume Linux dentro del contenedor DEBEN ir con LF:
+# con CRLF, el shebang se lee como "bash\r" y el contenedor no arranca.
+*.sh text eol=lf
+Dockerfile text eol=lf
+entrypoint.sh text eol=lf
+Makefile text eol=lf
+
+# Binarios
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.webp binary
+*.gif binary
